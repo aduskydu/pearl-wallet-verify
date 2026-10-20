@@ -1,0 +1,39 @@
+name: Verify an Intel fix build (no rebuild)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the intel-fix run whose pearl-wallet-intel-fixed artifact to check
+        default: '39470086444'
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-wallet-intel-fixed
+          path: fixed
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Same checks as for the official DMGs, on a fresh Intel runner
+        run: |
+          (cd fixed && shasum -a 256 -c SHA256SUMS.txt)
+          bash scripts/macos-inspect.sh "$(ls fixed/*.dmg)" x86_64 out
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-intel-fixed
+          path: out/
+          if-no-files-found: warn

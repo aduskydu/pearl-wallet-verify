@@ -80,7 +80,20 @@ if pgrep -f "$APP/Contents/MacOS" >/dev/null; then note "- quarantined launch: t
 pkill -f "$APP/Contents" 2>/dev/null || true
 pkill -f CoreServicesUIAgent 2>/dev/null || true
 xattr -dr com.apple.quarantine "$APP"
-note "- after xattr -dr com.apple.quarantine (the usual workaround) the app runs, as in the first launch above"
+open "$APP" >/dev/null 2>&1 &
+opid=$!
+sleep 20
+screencapture -x "$OUT/after-xattr-launch-$WANT.png"
+if pgrep -f "$APP/Contents/MacOS" >/dev/null; then
+  note "- after xattr -dr com.apple.quarantine: relaunched, the app started (after-xattr-launch-$WANT.png)"
+else
+  note "- ✗ after xattr -dr com.apple.quarantine: relaunched, the app did not start (after-xattr-launch-$WANT.png)"; fail=1
+fi
+kill "$opid" 2>/dev/null || true
+osascript -e "quit app \"$(basename "$APP" .app)\"" >/dev/null 2>&1 || true
+sleep 5
+pkill -f "$APP/Contents" 2>/dev/null || true
+pkill -f oyster-darwin 2>/dev/null || true
 sleep 2
 
 smoke() {  # oyster binary, label
