@@ -1,0 +1,75 @@
+name: Gatekeeper behaviour of official and fixed DMGs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Pearl Wallet release tag in pearl-research-labs/pearl
+        default: pearl-wallet-v3.0.0
+        required: true
+      intel_run:
+        description: intel-fix run with the pearl-wallet-intel-fixed artifact
+        required: true
+      arm_run:
+        description: arm64-resign run with the pearl-wallet-arm64-resigned artifact
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  UPSTREAM: pearl-research-labs/pearl
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  gatekeeper:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            pick: '^Pearl\.Wallet-[0-9.]+\.dmg$'
+            official: official-intel
+            artifact: pearl-wallet-intel-fixed
+            fixed: fixed-intel
+            run: intel
+          - runner: macos-15
+            pick: '^Pearl.*-arm64\.dmg$'
+            official: official-arm64
+            artifact: pearl-wallet-arm64-resigned
+            fixed: resigned-arm64
+            run: arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Official DMG
+        run: |
+          set -euo pipefail
+          name=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name' | grep -E '${{ matrix.pick }}' | head -1)
+          gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
+          h=$(shasum -a 256 "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          echo "OFFICIAL=dl/$name" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: fixed
+          run-id: ${{ matrix.run == 'intel' && inputs.intel_run || inputs.arm_run }}
+          github-token: ${{ github.token }}
+      - name: Official
+        run: bash scripts/gatekeeper-test.sh "$OFFICIAL" ${{ matrix.official }} out
+      - name: Fixed
+        run: |
+          (cd fixed && shasum -a 256 -c SHA256SUMS.txt)
+          bash scripts/gatekeeper-test.sh "$(ls fixed/*.dmg)" ${{ matrix.fixed }} out
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatekeeper-${{ matrix.run }}
+          path: out/
+          if-no-files-found: warn
