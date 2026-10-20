@@ -17,9 +17,14 @@ P=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 PIDFILE=$W/pid
 winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 
+killall_oyster() {  # Git Bash cannot kill a native Windows process by its MSYS pid; use taskkill there
+  if command -v taskkill >/dev/null 2>&1; then taskkill //F //IM "$(basename "$OY")" >/dev/null 2>&1 || true; fi
+}
 cleanup() {
   if [ -f "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
-  rm -rf "$W"
+  killall_oyster
+  sleep 2
+  rm -rf "$W" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -46,8 +51,9 @@ start() {  # appdata dir
   set_args "$d"
   "$OY" "${ARGS[@]}" > "$d/run.log" 2>&1 &
   echo $! > "$PIDFILE"
+  # getinfo needs the chain backend and is not supported in SPV mode; getbalance only needs the wallet.
   for i in $(seq 1 60); do
-    if rpc getinfo | jq -e '.result != null' >/dev/null 2>&1; then return 0; fi
+    if rpc getbalance | jq -e 'has("result") and .error == null' >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
   echo "oyster RPC did not come up; last log lines:" >&2
@@ -60,6 +66,7 @@ stop() {
   local pid; pid=$(cat "$PIDFILE")
   for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   kill "$pid" 2>/dev/null || true
+  killall_oyster
   rm -f "$PIDFILE"
 }
 
@@ -75,9 +82,10 @@ echo "12-word mnemonic printed (not shown)"
 
 echo "== 2. run the wallet (SPV) and get a new address"
 start "$W/a"
-info=$(rpc getinfo)
-jq -c '.result | {version, protocolversion, blocks, connections, testnet}' <<<"$info" || echo "$info"
-addr1=$(rpc getnewaddress | jq -r '.result // empty')
+echo "getbalance: $(rpc getbalance | jq -c '.result')"
+na=$(rpc getnewaddress)
+addr1=$(jq -r '.result // empty' <<<"$na")
+[ -n "$addr1" ] || echo "getnewaddress: $na" >&2
 echo "address: $addr1"
 [[ "$addr1" =~ ^prl1[02-9ac-hj-np-z]{20,}$ ]] || { echo "not a prl1 address: '$addr1'" >&2; exit 1; }
 valid=$(rpc validateaddress "[\"$addr1\"]")
@@ -85,14 +93,10 @@ jq -c '.result | {isvalid, ismine, iswitness, witness_version}' <<<"$valid" || t
 jq -e '.result.isvalid == true and .result.ismine == true' >/dev/null <<<"$valid" || { echo "validateaddress: $valid" >&2; exit 1; }
 
 echo "== 3. SPV progress with the live network (90 s, informational)"
-best=0
-for _ in $(seq 1 18); do
-  b=$(rpc getinfo | jq -r '.result.blocks // 0' 2>/dev/null || echo 0)
-  c=$(rpc getinfo | jq -r '.result.connections // 0' 2>/dev/null || echo 0)
-  [ "$b" -gt "$best" ] 2>/dev/null && best=$b
-  sleep 5
-done
-echo "SPV: best block height seen ${best}, peers ${c:-0}"
+sleep 90
+hdr=$(grep -oE 'Processed [0-9]+ blocks.*\(height [0-9]+' "$W/a/run.log" | tail -1 | grep -oE '[0-9]+$' || true)
+flt=$(grep -oE 'filter headers .*\(height [0-9]+' "$W/a/run.log" | tail -1 | grep -oE '[0-9]+$' || true)
+echo "SPV: block headers synced to height ${hdr:-0}, filter headers to ${flt:-0}, wallet synced to $(rpc getblockcount | jq -r '.result // "?"') (from scratch, about $(( $(wc -l < "$W/a/run.log") )) log lines)"
 stop
 
 echo "== 4. restore from the mnemonic: same first address"

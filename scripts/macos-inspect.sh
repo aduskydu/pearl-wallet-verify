@@ -63,6 +63,22 @@ pkill -f "$APP/Contents" 2>/dev/null || true
 pkill -f oyster-darwin 2>/dev/null || true
 sleep 2
 
+echo "== what a browser download would see: mark the app as quarantined (as Safari/Chrome do) and launch again"
+xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$APP"
+gkq=$(spctl --assess --type execute -vv "$APP" 2>&1); note "- quarantined: spctl --assess: $(tr '\n' ' ' <<<"$gkq")"
+if command -v syspolicy_check >/dev/null 2>&1; then
+  spc=$(syspolicy_check distribution "$APP" 2>&1 | head -12); note "- syspolicy_check distribution:"; sed 's/^/    /' <<<"$spc" | tee -a "$REPORT"
+fi
+open "$APP" 2>&1 | tee -a "$REPORT" || true
+sleep 15
+screencapture -x "$OUT/quarantined-launch-$WANT.png"
+if pgrep -f "$APP/Contents/MacOS" >/dev/null; then note "- quarantined launch: the app started (Gatekeeper let it run)"; else note "- quarantined launch: the app did NOT start; Gatekeeper's dialog is in quarantined-launch-$WANT.png"; fi
+pkill -f "$APP/Contents" 2>/dev/null || true
+pkill -f CoreServicesUIAgent 2>/dev/null || true
+xattr -dr com.apple.quarantine "$APP"
+note "- after xattr -dr com.apple.quarantine (the usual workaround) the app runs, as in the first launch above"
+sleep 2
+
 echo "== oyster wallet test"
 if bash "$HERE/oyster-smoke.sh" "$OY" 2>&1 | tee "$OUT/oyster-smoke-$WANT.log"; then
   note "- oyster wallet test: $(tail -1 "$OUT/oyster-smoke-$WANT.log")"
