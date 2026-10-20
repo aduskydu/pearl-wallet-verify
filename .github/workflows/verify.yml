@@ -48,25 +48,32 @@ jobs:
         include:
           - runner: macos-15-intel
             arch: x86_64
+            goarch: amd64
             pick: '^Pearl\.Wallet-[0-9.]+\.dmg$'
           - runner: macos-15
             arch: arm64
+            goarch: arm64
             pick: '^Pearl.*-arm64\.dmg$'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Download the DMG and checksums.txt
+      - name: Download the DMG, the command-line package and checksums.txt
         run: |
           set -euo pipefail
-          name=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name' | grep -E '${{ matrix.pick }}' | head -1)
-          echo "asset: $name"
+          names=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
+          name=$(grep -E '${{ matrix.pick }}' <<<"$names" | head -1)
+          gob=$(grep -E '^go-binaries-darwin-${{ matrix.goarch }}-.*\.tar\.gz$' <<<"$names" | head -1 || true)
+          echo "assets: $name ${gob:-(no go-binaries package)}"
           gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
-          h=$(shasum -a 256 "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          [ -z "$gob" ] || gh release download "$TAG" -R "$UPSTREAM" -p "$gob" -D dl
+          for f in "dl/$name" ${gob:+"dl/$gob"}; do h=$(shasum -a 256 "$f" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt; done
           echo "DMG=dl/$name" >> "$GITHUB_ENV"
+          echo "GOBIN=${gob:+dl/$gob}" >> "$GITHUB_ENV"
       - name: Inspect, install, launch, wallet test
-        run: bash scripts/macos-inspect.sh "$DMG" "${{ matrix.arch }}" out
+        run: bash scripts/macos-inspect.sh "$DMG" "${{ matrix.arch }}" out "$GOBIN"
       - name: Upload report and screenshot
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,6 +85,7 @@ jobs:
   windows:
     needs: checksums
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:

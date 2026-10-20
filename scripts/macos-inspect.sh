@@ -2,11 +2,12 @@
 # Inspect the official Pearl Wallet DMG on a macOS runner:
 #   versions, minimum macOS, architectures, code signature / Gatekeeper / notarization,
 #   install (copy the app out of the DMG), launch it and take a screenshot, then run the oyster wallet test.
-# Usage: macos-inspect.sh <dmg> <expected arch: x86_64|arm64> <output dir>
+# Usage: macos-inspect.sh <dmg> <expected arch: x86_64|arm64> <output dir> [go-binaries tarball of the same release]
 set -uo pipefail
 DMG=$1
 WANT=$2
 OUT=$3
+GOBIN_TGZ=${4:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 REPORT=$OUT/report.md
@@ -69,9 +70,12 @@ gkq=$(spctl --assess --type execute -vv "$APP" 2>&1); note "- quarantined: spctl
 if command -v syspolicy_check >/dev/null 2>&1; then
   spc=$(syspolicy_check distribution "$APP" 2>&1 | head -12); note "- syspolicy_check distribution:"; sed 's/^/    /' <<<"$spc" | tee -a "$REPORT"
 fi
-open "$APP" 2>&1 | tee -a "$REPORT" || true
-sleep 15
+# open can block on Gatekeeper's dialog: run it in the background and stop waiting after 20 s.
+open "$APP" >/dev/null 2>&1 &
+opid=$!
+sleep 20
 screencapture -x "$OUT/quarantined-launch-$WANT.png"
+kill "$opid" 2>/dev/null || true
 if pgrep -f "$APP/Contents/MacOS" >/dev/null; then note "- quarantined launch: the app started (Gatekeeper let it run)"; else note "- quarantined launch: the app did NOT start; Gatekeeper's dialog is in quarantined-launch-$WANT.png"; fi
 pkill -f "$APP/Contents" 2>/dev/null || true
 pkill -f CoreServicesUIAgent 2>/dev/null || true
@@ -79,12 +83,29 @@ xattr -dr com.apple.quarantine "$APP"
 note "- after xattr -dr com.apple.quarantine (the usual workaround) the app runs, as in the first launch above"
 sleep 2
 
-echo "== oyster wallet test"
-if bash "$HERE/oyster-smoke.sh" "$OY" 2>&1 | tee "$OUT/oyster-smoke-$WANT.log"; then
-  note "- oyster wallet test: $(tail -1 "$OUT/oyster-smoke-$WANT.log")"
-  grep -E '^(address|SPV|restored)' "$OUT/oyster-smoke-$WANT.log" | sed 's/^/    /' | tee -a "$REPORT"
-else
-  note "- ✗ oyster wallet test failed (see oyster-smoke-$WANT.log)"; fail=1
+smoke() {  # oyster binary, label
+  if bash "$HERE/oyster-smoke.sh" "$1" 2>&1 | tee "$OUT/oyster-smoke-$2.log"; then
+    note "- $2 wallet test: $(tail -1 "$OUT/oyster-smoke-$2.log")"
+    grep -E '^(address|SPV|restored)' "$OUT/oyster-smoke-$2.log" | sed 's/^/    /' | tee -a "$REPORT"
+    return 0
+  fi
+  note "- ✗ $2 wallet test failed: $(grep -v '^==' "$OUT/oyster-smoke-$2.log" | tail -2 | tr '\n' ' ')"
+  return 1
+}
+
+echo "== oyster wallet test (the oyster inside the app)"
+smoke "$OY" "bundled-oyster-$WANT" || fail=1
+
+if [ -n "$GOBIN_TGZ" ] && [ -f "$GOBIN_TGZ" ]; then
+  echo "== the oyster from the release's separate command-line package"
+  G=$(mktemp -d); tar xzf "$GOBIN_TGZ" -C "$G"
+  GOY=$(find "$G" -type f -name 'oyster*' -perm -u+x | head -1)
+  if [ -n "$GOY" ]; then
+    note "- $(basename "$GOBIN_TGZ"): oyster archs $(lipo -archs "$GOY"), minos $(minos "$GOY"), $(shasum -a 256 "$GOY" | cut -c1-16)…"
+    smoke "$GOY" "cli-package-oyster-$WANT" || true
+  else
+    note "- no oyster in $(basename "$GOBIN_TGZ")"
+  fi
 fi
 cat "$REPORT" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 exit $fail
