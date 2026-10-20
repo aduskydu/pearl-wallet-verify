@@ -1,0 +1,74 @@
+name: Apple Silicon fix - ad-hoc bundle signature for the official Pearl Wallet DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Pearl Wallet release tag in pearl-research-labs/pearl
+        default: pearl-wallet-v3.0.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: pearl-research-labs/pearl
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Re-sign the official arm64 app (signatures only)
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          names=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
+          name=$(grep -E '^Pearl.*-arm64\.dmg$' <<<"$names" | head -1)
+          gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
+          h=$(shasum -a 256 "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          ver=${name#Pearl.Wallet-}; ver=${ver%-arm64.dmg}
+          mkdir -p dist
+          OUT="dist/Pearl-Wallet-$ver-arm64-resigned.dmg"
+          bash scripts/arm64-resign.sh "dl/$name" "$OUT" 2>&1 | tee dist/resign.log
+          (cd dist && shasum -a 256 "$(basename "$OUT")" | tee SHA256SUMS.txt)
+          {
+            echo "### Apple Silicon re-sign for $TAG"
+            echo "Official DMG: \`$name\` sha256 \`$h\`; whole app re-signed ad hoc, nothing else changed."
+            echo '```'; grep -E '^(identical files|wrote)' dist/resign.log; cat dist/SHA256SUMS.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-wallet-arm64-resigned
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-wallet-arm64-resigned
+          path: fixed
+      - name: Same checks as for the official DMGs, on a fresh Apple Silicon runner
+        run: |
+          (cd fixed && shasum -a 256 -c SHA256SUMS.txt)
+          bash scripts/macos-inspect.sh "$(ls fixed/*.dmg)" arm64 out
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-arm64-resigned
+          path: out/
+          if-no-files-found: warn
