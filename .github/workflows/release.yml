@@ -1,0 +1,58 @@
+name: Publish the fixed DMGs as a release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag of the release to create in this repository
+        default: pearl-wallet-v3.0.0-fix1
+        required: true
+      intel_run:
+        description: intel-fix run whose pearl-wallet-intel-fixed artifact to publish
+        required: true
+      arm_run:
+        description: arm64-resign run whose pearl-wallet-arm64-resigned artifact to publish
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-wallet-intel-fixed
+          path: intel
+          run-id: ${{ inputs.intel_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-wallet-arm64-resigned
+          path: arm
+          run-id: ${{ inputs.arm_run }}
+          github-token: ${{ github.token }}
+      - name: Check the files against the hashes their build runs recorded
+        run: |
+          set -euo pipefail
+          (cd intel && sha256sum -c SHA256SUMS.txt)
+          (cd arm && sha256sum -c SHA256SUMS.txt)
+          cat intel/SHA256SUMS.txt arm/SHA256SUMS.txt > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          test -f "release-notes/$TAG.md"
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Pearl Wallet 3.0.0: Intel fix and Apple Silicon re-sign (unofficial)" \
+            --notes-file "release-notes/$TAG.md" \
+            intel/*.dmg intel/oyster-darwin-x64 arm/*.dmg SHA256SUMS.txt
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[] | "\(.name) \(.size)")'

@@ -4,13 +4,15 @@
 # _CodeSignature/CodeResources, so codesign and Gatekeeper report "code has no resources but signature indicates they
 # must be present" and macOS calls a downloaded copy "damaged". With a full ad-hoc bundle signature the bundle
 # verifies; a downloaded copy then gets the ordinary "could not verify" dialog (still no Developer ID, not notarized).
-# Checks: codesign --verify --deep --strict passes; with signatures removed every Mach-O file is byte-identical to the
-# official one; every other file is byte-identical; the only new files are inside _CodeSignature directories.
+# Checks: codesign --verify --deep --strict passes; every Mach-O file is byte-identical to the official one apart from its
+# code signature (scripts/macho-same-code.py); every other file is byte-identical; the only new files are inside
+# _CodeSignature directories.
 # Usage: arm64-resign.sh <official arm64 dmg> <output dmg>
 set -euo pipefail
 OFFICIAL=$1
 OUT=$2
 W=$(mktemp -d)
+HERE=$(cd "$(dirname "$0")" && pwd)
 
 hdiutil convert "$OFFICIAL" -format UDRW -o "$W/rw.dmg" >/dev/null
 mb=$(( $(stat -f%z "$W/rw.dmg") / 1048576 + 200 ))
@@ -28,7 +30,6 @@ codesign -dv "$APP" 2>&1 | grep -E '^(Format|CodeDirectory|Signature|Sealed Reso
 
 echo "== compare with the official app"
 bad=0; macho=0; same=0; newfiles=0
-strip_sig() { cp "$1" "$2"; chmod u+w "$2"; codesign --remove-signature "$2" 2>/dev/null || true; }
 while IFS= read -r -d '' f; do
   rel=${f#"$APP"/}
   o="$W/orig.app/$rel"
@@ -38,8 +39,7 @@ while IFS= read -r -d '' f; do
   fi
   if cmp -s "$f" "$o"; then same=$((same + 1)); continue; fi
   if file -b "$o" | grep -q 'Mach-O'; then
-    strip_sig "$f" "$W/a"; strip_sig "$o" "$W/b"
-    if cmp -s "$W/a" "$W/b"; then macho=$((macho + 1)); else echo "Mach-O differs beyond its signature: $rel"; bad=1; fi
+    if why=$(python3 "$HERE/macho-same-code.py" "$o" "$f"); then macho=$((macho + 1)); else echo "Mach-O differs beyond its signature: $rel ($why)"; bad=1; fi
   else
     case "$rel" in */_CodeSignature/*) newfiles=$((newfiles + 1)) ;; *) echo "file changed: $rel"; bad=1 ;; esac
   fi
