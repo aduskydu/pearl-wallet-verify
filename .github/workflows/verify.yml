@@ -1,0 +1,152 @@
+name: Verify the official Pearl Wallet release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag in pearl-research-labs/pearl
+        default: pearl-wallet-v3.0.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: pearl-research-labs/pearl
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every asset and check it against checksums.txt and GitHub's own digest
+        run: |
+          set -euo pipefail
+          mkdir dl && cd dl
+          gh release download "$TAG" -R "$UPSTREAM"
+          gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[] | "\(.name)\t\(.digest // "-")\t\(.size)"' > ../api.tsv
+          echo "### $UPSTREAM $TAG: checksums" >> "$GITHUB_STEP_SUMMARY"
+          echo '| asset | size | sha256 | in checksums.txt | GitHub digest |' >> "$GITHUB_STEP_SUMMARY"
+          echo '|---|---|---|---|---|' >> "$GITHUB_STEP_SUMMARY"
+          cat checksums.txt
+          bad=0
+          while IFS=$'\t' read -r name digest size; do
+            [ "$name" = checksums.txt ] && continue
+            h=$(sha256sum "$name" | cut -d' ' -f1)
+            if grep -qi "$h" checksums.txt; then inlist="yes ($(grep -i "$h" checksums.txt | awk '{$1=""; print}' | xargs))"; else inlist="NO"; bad=1; fi
+            if [ "$digest" = "-" ]; then gd="n/a"; elif [ "$digest" = "sha256:$h" ]; then gd="match"; else gd="MISMATCH"; bad=1; fi
+            echo "| $name | $size | \`$h\` | $inlist | $gd |" >> "$GITHUB_STEP_SUMMARY"
+          done < ../api.tsv
+          exit $bad
+
+  macos:
+    needs: checksums
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+            pick: '^Pearl.*[0-9]\.dmg$'
+          - runner: macos-15
+            arch: arm64
+            pick: '^Pearl.*-arm64\.dmg$'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Download the DMG and checksums.txt
+        run: |
+          set -euo pipefail
+          name=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name' | grep -E '${{ matrix.pick }}' | head -1)
+          echo "asset: $name"
+          gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
+          h=$(shasum -a 256 "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          echo "DMG=dl/$name" >> "$GITHUB_ENV"
+      - name: Inspect, install, launch, wallet test
+        run: bash scripts/macos-inspect.sh "$DMG" "${{ matrix.arch }}" out
+      - name: Upload report and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: warn
+
+  windows:
+    needs: checksums
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Download the installer and checksums.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name' | grep -E '^Pearl-Wallet-Setup-.*\.exe$' | head -1)
+          echo "asset: $name"
+          gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
+          h=$(sha256sum "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          echo "SETUP=dl/$name" >> "$GITHUB_ENV"
+      - name: Signature, silent install, launch, screenshot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force out | Out-Null
+          $r = "out/report.md"
+          function Note($s) { $s | Tee-Object -FilePath $r -Append }
+          Note "### $(Split-Path $env:SETUP -Leaf) on $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)"
+          $s = Get-AuthenticodeSignature $env:SETUP
+          Note "- installer Authenticode: $($s.Status) $($s.SignerCertificate.Subject)"
+          Start-Process -FilePath $env:SETUP -ArgumentList '/S' -Wait
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter 'Pearl Wallet.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { $exe = Get-ChildItem 'C:\Program Files' -Recurse -Filter 'Pearl Wallet.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if (-not $exe) { throw 'Pearl Wallet.exe not found after silent install' }
+          $dir = $exe.DirectoryName
+          Note "- installed to: $dir (per-user, no admin prompt)"
+          Note "- Pearl Wallet.exe version: $($exe.VersionInfo.ProductVersion), file $($exe.VersionInfo.FileVersion)"
+          $s2 = Get-AuthenticodeSignature $exe.FullName
+          Note "- Pearl Wallet.exe Authenticode: $($s2.Status) $($s2.SignerCertificate.Subject)"
+          $oy = Get-ChildItem "$dir\resources\bin" -Filter 'oyster-windows-*.exe' | Select-Object -First 1
+          if (-not $oy) { throw 'bundled oyster not found' }
+          $s3 = Get-AuthenticodeSignature $oy.FullName
+          Note "- bundled oyster: $($oy.Name), Authenticode $($s3.Status), sha256 $((Get-FileHash $oy.FullName).Hash.Substring(0,16).ToLower())..."
+          "OYSTER=$($oy.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APPDIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Start-Process -FilePath $exe.FullName
+          Start-Sleep -Seconds 30
+          $p = Get-Process | Where-Object { $_.Path -like "$dir*" }
+          if ($p) { Note "- launched: $($p.Count) process(es) running after 30 s" } else { Note "- app not running 30 s after launch"; $fail = $true }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD\out\screenshot-windows.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Note "- screenshot: screenshot-windows.png"
+          Get-Process | Where-Object { $_.Path -like "$dir*" } | Stop-Process -Force
+          Start-Sleep -Seconds 3
+          if ($fail) { exit 1 }
+      - name: oyster wallet test
+        shell: bash
+        run: |
+          set -o pipefail
+          OY=$(cygpath -u "$OYSTER")
+          bash scripts/oyster-smoke.sh "$OY" 2>&1 | tee out/oyster-smoke-windows.log
+          { echo "- oyster wallet test: $(tail -1 out/oyster-smoke-windows.log)"; grep -E '^(address|SPV|restored)' out/oyster-smoke-windows.log | sed 's/^/    /'; } | tee -a out/report.md
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Silent uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $u = Get-ChildItem "$env:APPDIR" -Filter 'Uninstall*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($u) { Start-Process -FilePath $u.FullName -ArgumentList '/S' -Wait; "uninstalled" } else { "no uninstaller found" }
+      - name: Upload report and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/
+          if-no-files-found: warn
