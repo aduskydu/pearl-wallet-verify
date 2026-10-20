@@ -1,0 +1,132 @@
+name: Intel Mac fix - native x86_64 oyster in the official Pearl Wallet DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Pearl Wallet release tag in pearl-research-labs/pearl
+        default: pearl-wallet-v3.0.0
+        required: true
+      commit:
+        description: Commit the tag must point at
+        default: 837c69c52a831fff5fa733a358da8b3ae7d8c35c
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: pearl-research-labs/pearl
+  TAG: ${{ inputs.tag }}
+  COMMIT: ${{ inputs.commit }}
+  GH_TOKEN: ${{ github.token }}
+  # Go 1.26 supports macOS 12 and later; cgo, Rust and the XMSS C build follow this target.
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - name: This repository (scripts)
+        uses: actions/checkout@v5
+        with:
+          path: kit
+          persist-credentials: false
+
+      - name: Official source at the release tag
+        uses: actions/checkout@v5
+        with:
+          repository: pearl-research-labs/pearl
+          ref: ${{ inputs.tag }}
+          path: pearl
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check the source commit
+        run: |
+          got=$(git -C pearl rev-parse HEAD)
+          echo "source commit: $got"
+          test "$got" = "$COMMIT"
+
+      - name: Go (same version as the official build)
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.6'
+          cache: false
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ github.token }}
+
+      - name: Build oyster natively on Intel (the official task build:oyster)
+        working-directory: pearl
+        run: |
+          set -euo pipefail
+          uname -m; test "$(uname -m)" = x86_64
+          sw_vers; go version; rustc -V; cargo -V; clang --version | head -1
+          task build:oyster
+          lipo -archs bin/oyster
+          vtool -show-build bin/oyster | awk '$1 == "minos" || $1 == "sdk"'
+          otool -L bin/oyster
+          test "$(lipo -archs bin/oyster)" = x86_64
+          ./bin/oyster --version
+
+      - name: Wallet test of the new oyster
+        run: bash kit/scripts/oyster-smoke.sh pearl/bin/oyster
+
+      - name: Repackage the official Intel DMG with the new oyster
+        run: |
+          set -euo pipefail
+          names=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
+          name=$(grep -E '^Pearl\.Wallet-[0-9.]+\.dmg$' <<<"$names" | head -1)
+          gh release download "$TAG" -R "$UPSTREAM" -p "$name" -p checksums.txt -D dl
+          h=$(shasum -a 256 "dl/$name" | cut -d' ' -f1); grep -qi "$h" dl/checksums.txt
+          ver=${name#Pearl.Wallet-}; ver=${ver%.dmg}
+          mkdir -p dist
+          OUT="dist/Pearl-Wallet-$ver-intel-fixed.dmg"
+          bash kit/scripts/intel-repackage.sh "dl/$name" pearl/bin/oyster "$OUT"
+          cp pearl/bin/oyster "dist/oyster-darwin-x64"
+          (cd dist && shasum -a 256 "$(basename "$OUT")" oyster-darwin-x64 | tee SHA256SUMS.txt)
+          {
+            echo "### Intel fix for $TAG (source $COMMIT)"
+            echo "Official DMG: \`$name\` sha256 \`$h\`; only Contents/Resources/bin/oyster-darwin-x64 replaced (native x86_64 build, macOS $MACOSX_DEPLOYMENT_TARGET+)."
+            echo '```'; cat dist/SHA256SUMS.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pearl-wallet-intel-fixed
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-wallet-intel-fixed
+          path: fixed
+      - name: Same checks as for the official DMGs, on a fresh Intel runner
+        run: |
+          (cd fixed && shasum -a 256 -c SHA256SUMS.txt)
+          bash scripts/macos-inspect.sh "$(ls fixed/*.dmg)" x86_64 out
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-intel-fixed
+          path: out/
+          if-no-files-found: warn
